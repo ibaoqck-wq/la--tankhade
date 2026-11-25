@@ -1,5 +1,14 @@
 const OFFICIAL_HOTLINE = '+966118136644';
 const OFFICIAL_WA_BASE = 'https://wa.me/966118136644';
+const LOCAL_STORAGE_KEY = 'la_tankhade_anon_records_v1';
+
+const defaultLocalRecords = [
+  { pre_score: 60, post_score: 75, retention_score: 74, challenge_score: 80, senior_mode: 0 },
+  { pre_score: 55, post_score: 75, retention_score: 72, challenge_score: 80, senior_mode: 0 },
+  { pre_score: 65, post_score: 80, retention_score: 78, challenge_score: 100, senior_mode: 1 },
+  { pre_score: 60, post_score: 80, retention_score: 77, challenge_score: 80, senior_mode: 0 },
+  { pre_score: 60, post_score: 75, retention_score: 73, challenge_score: 60, senior_mode: 1 }
+];
 
 let impactChart = null;
 let roundIdx = 0;
@@ -96,12 +105,15 @@ function toggleSeniorMode() {
   document.body.classList.toggle('senior-mode');
   const active = isSeniorActive();
   const btn = document.getElementById('seniorToggle');
-  btn.textContent = active ? '✅ وضع كبار السن مفعّل' : '👴 وضع كبار السن';
-  btn.setAttribute('aria-pressed', String(active));
+  if (btn) {
+    btn.textContent = active ? '✅ وضع كبار السن مفعّل' : '👴 وضع كبار السن';
+    btn.setAttribute('aria-pressed', String(active));
+  }
 }
 
 function copyHotlineNumber() {
   const statusEl = document.getElementById('copyStatus');
+  if (!statusEl) return;
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(OFFICIAL_HOTLINE)
       .then(() => {
@@ -373,6 +385,16 @@ function analyzeMessageDynamically() {
   `;
 }
 
+function speakArabicText(text) {
+  const clean = String(text || '').trim();
+  if (!clean || !('speechSynthesis' in window)) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(clean);
+  utter.lang = 'ar-SA';
+  utter.rate = 0.95;
+  window.speechSynthesis.speak(utter);
+}
+
 function loadScenarioSet(mode) {
   activeScenarios = scenarioPool[mode] || scenarioPool.mixed;
   roundIdx = 0;
@@ -389,16 +411,96 @@ function renderScenario() {
   document.getElementById('scenarioText').textContent = s.text;
 }
 
-async function saveAnonymousAssessment(payload) {
-  const res = await fetch('/api/assessments', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    throw new Error('تعذر حفظ النتيجة في قاعدة البيانات.');
+function getLocalRecords() {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (!raw) {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(defaultLocalRecords));
+      return [...defaultLocalRecords];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : [...defaultLocalRecords];
+  } catch (_) {
+    return [...defaultLocalRecords];
   }
+}
+
+function computeMetricsFromRecords(records) {
+  const total = records.length;
+  if (!total) {
+    return { total_participants: 0, avg_pre: 0, avg_post: 0, avg_retention: 0, avg_challenge: 0, relative_gain: 0 };
+  }
+  const avg = (key) => Math.round((records.reduce((acc, r) => acc + Number(r[key] || 0), 0) / total) * 10) / 10;
+  const avg_pre = avg('pre_score');
+  const avg_post = avg('post_score');
+  const relative_gain = avg_pre > 0 ? Math.round(((avg_post - avg_pre) / avg_pre) * 1000) / 10 : 0;
+  return {
+    total_participants: total,
+    avg_pre,
+    avg_post,
+    avg_retention: avg('retention_score'),
+    avg_challenge: avg('challenge_score'),
+    relative_gain
+  };
+}
+
+function applyMetricsToUI(m) {
+  document.getElementById('statParticipants').textContent = m.total_participants;
+  document.getElementById('heroBeneficiaries').textContent = `${m.total_participants}+`;
+  document.getElementById('statPreScore').textContent = `${m.avg_pre}%`;
+  document.getElementById('statPostScore').textContent = `${m.avg_post}%`;
+  document.getElementById('statRetentionScore').textContent = `${m.avg_retention}%`;
+
+  const gainText = `${m.relative_gain >= 0 ? '+' : ''}${m.relative_gain}%`;
+  document.getElementById('heroGain').textContent = gainText;
+
+  if (impactChart) {
+    impactChart.data.datasets[0].data = [m.avg_pre, m.avg_post, m.avg_retention, m.avg_challenge];
+    impactChart.update();
+  }
+}
+
+async function refreshMetrics() {
+  try {
+    const res = await fetch('/api/metrics');
+    if (res.ok) {
+      const m = await res.json();
+      applyMetricsToUI(m);
+      return 'server';
+    }
+  } catch (_) {
+    // السقوط التلقائي إلى التخزين المحلي عند العمل على استضافة ثابتة مثل GitHub Pages
+  }
+  applyMetricsToUI(computeMetricsFromRecords(getLocalRecords()));
+  return 'local';
+}
+
+async function saveAnonymousAssessment(payload) {
+  try {
+    const res = await fetch('/api/assessments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (res.ok) {
+      await refreshMetrics();
+      return 'server';
+    }
+  } catch (_) {
+    // السقوط التلقائي إلى التخزين المحلي عند غياب الخادم الخلفي
+  }
+
+  const records = getLocalRecords();
+  records.push({
+    pre_score: Number(payload.pre_score || 60),
+    post_score: Number(payload.post_score || 75),
+    retention_score: Number(payload.retention_score || payload.post_score || 75),
+    challenge_score: Number(payload.challenge_score || 0),
+    senior_mode: payload.senior_mode ? 1 : 0
+  });
+  localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(records));
   await refreshMetrics();
+  return 'local';
 }
 
 async function answerScenario(userSaidScam) {
@@ -423,14 +525,17 @@ async function answerScenario(userSaidScam) {
     fb.innerHTML += `<br/><strong>أنهيت المجموعة (${finalScore}/100) — جارٍ حفظ النتيجة المجهولة...</strong>`;
 
     try {
-      await saveAnonymousAssessment({
+      const modeUsed = await saveAnonymousAssessment({
         pre_score: 60,
         post_score: Math.max(60, finalScore),
         retention_score: Math.max(55, Math.min(100, finalScore - 2)),
         challenge_score: finalScore,
         senior_mode: isSeniorActive()
       });
-      fb.innerHTML += `<br/><span style="color:#15803d; font-weight:700;">تم تسجيل النتيجة المجهولة في قاعدة البيانات.</span>`;
+      const note = modeUsed === 'server'
+        ? 'تم تسجيل النتيجة المجهولة في قاعدة البيانات.'
+        : 'تم حفظ النتيجة المجهولة محلياً في المتصفح.';
+      fb.innerHTML += `<br/><span style="color:#15803d; font-weight:700;">${note}</span>`;
     } catch (err) {
       fb.innerHTML += `<br/><span style="color:#b91c1c;">${escapeHtml(err.message)}</span>`;
     }
@@ -442,7 +547,9 @@ async function answerScenario(userSaidScam) {
 }
 
 function initChart() {
-  const ctx = document.getElementById('impactChart').getContext('2d');
+  const canvas = document.getElementById('impactChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const ctx = canvas.getContext('2d');
   impactChart = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -476,63 +583,59 @@ function initChart() {
   });
 }
 
-async function refreshMetrics() {
-  try {
-    const res = await fetch('/api/metrics');
-    if (!res.ok) return;
-    const m = await res.json();
-
-    document.getElementById('statParticipants').textContent = m.total_participants;
-    document.getElementById('heroBeneficiaries').textContent = `${m.total_participants}+`;
-    document.getElementById('statPreScore').textContent = `${m.avg_pre}%`;
-    document.getElementById('statPostScore').textContent = `${m.avg_post}%`;
-    document.getElementById('statRetentionScore').textContent = `${m.avg_retention}%`;
-
-    const gainText = `${m.relative_gain >= 0 ? '+' : ''}${m.relative_gain}%`;
-    document.getElementById('heroGain').textContent = gainText;
-
-    if (impactChart) {
-      impactChart.data.datasets[0].data = [m.avg_pre, m.avg_post, m.avg_retention, m.avg_challenge];
-      impactChart.update();
-    }
-  } catch (_) {
-    // يعمل محلياً دون خادم خلفي عند فتح الملف مباشرة
-  }
-}
-
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('seniorToggle').addEventListener('click', toggleSeniorMode);
+  const seniorBtn = document.getElementById('seniorToggle');
+  if (seniorBtn) {
+    seniorBtn.addEventListener('click', toggleSeniorMode);
+  }
 
   const urlInput = document.getElementById('urlInput');
-  urlInput.addEventListener('paste', () => {
-    const autoOpen = document.getElementById('autoOpenWaOnPaste').checked;
-    setTimeout(() => {
-      handleUrlAnalysis(autoOpen);
-    }, 50);
+  if (urlInput) {
+    urlInput.addEventListener('paste', () => {
+      const autoOpen = document.getElementById('autoOpenWaOnPaste')?.checked || false;
+      setTimeout(() => {
+        handleUrlAnalysis(autoOpen);
+      }, 50);
+    });
+  }
+
+  document.getElementById('checkLinkBtn')?.addEventListener('click', () => handleUrlAnalysis(false));
+  document.getElementById('sendToWaBtn')?.addEventListener('click', () => handleUrlAnalysis(true));
+  document.getElementById('copyHotlineBtn')?.addEventListener('click', copyHotlineNumber);
+
+  document.getElementById('analyzeMsgBtn')?.addEventListener('click', analyzeMessageDynamically);
+  document.getElementById('speakMsgBtn')?.addEventListener('click', () => {
+    const msgText = document.getElementById('messageInput')?.value || '';
+    speakArabicText(msgText);
+  });
+  document.getElementById('clearMsgBtn')?.addEventListener('click', () => {
+    const msgInput = document.getElementById('messageInput');
+    if (msgInput) msgInput.value = '';
+    const msgRes = document.getElementById('msgResult');
+    if (msgRes) {
+      msgRes.innerHTML = '<strong>جاهز:</strong> اكتب أي رسالة ليتم حساب نسبة الاشتباه، وتلوين المؤشرات داخل النص، وعرض خطوات التحقق الرسمية.';
+    }
   });
 
-  document.getElementById('checkLinkBtn').addEventListener('click', () => handleUrlAnalysis(false));
-  document.getElementById('sendToWaBtn').addEventListener('click', () => handleUrlAnalysis(true));
-  document.getElementById('copyHotlineBtn').addEventListener('click', copyHotlineNumber);
-
-  document.getElementById('analyzeMsgBtn').addEventListener('click', analyzeMessageDynamically);
-  document.getElementById('clearMsgBtn').addEventListener('click', () => {
-    document.getElementById('messageInput').value = '';
-    document.getElementById('msgResult').innerHTML = '<strong>جاهز:</strong> اكتب أي رسالة ليتم حساب نسبة الاشتباه، وتلوين المؤشرات داخل النص، وعرض خطوات التحقق الرسمية.';
+  document.getElementById('speakScenarioBtn')?.addEventListener('click', () => {
+    const current = activeScenarios[roundIdx];
+    if (current) {
+      speakArabicText(`${current.sender}. ${current.text}`);
+    }
   });
 
-  document.getElementById('difficultySelect').addEventListener('change', (e) => {
+  document.getElementById('difficultySelect')?.addEventListener('change', (e) => {
     loadScenarioSet(e.target.value);
   });
 
-  document.getElementById('restartChallengeBtn').addEventListener('click', () => {
-    loadScenarioSet(document.getElementById('difficultySelect').value);
+  document.getElementById('restartChallengeBtn')?.addEventListener('click', () => {
+    loadScenarioSet(document.getElementById('difficultySelect')?.value || 'mixed');
   });
 
-  document.getElementById('btnScam').addEventListener('click', () => answerScenario(true));
-  document.getElementById('btnSafe').addEventListener('click', () => answerScenario(false));
+  document.getElementById('btnScam')?.addEventListener('click', () => answerScenario(true));
+  document.getElementById('btnSafe')?.addEventListener('click', () => answerScenario(false));
 
-  document.getElementById('assessmentForm').addEventListener('submit', async (e) => {
+  document.getElementById('assessmentForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const statusEl = document.getElementById('saveStatus');
     const preVal = parseInt(document.getElementById('preScoreInput').value, 10);
@@ -540,16 +643,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const retVal = parseInt(document.getElementById('retentionScoreInput').value, 10);
 
     try {
-      await saveAnonymousAssessment({
+      const modeUsed = await saveAnonymousAssessment({
         pre_score: preVal,
         post_score: postVal,
         retention_score: retVal,
         challenge_score: postVal,
         senior_mode: isSeniorActive()
       });
-      statusEl.textContent = 'تم حفظ النتيجة المجهولة (قبلي / بعدي / تثبيت 3–4 أسابيع) بنجاح.';
+      if (statusEl) {
+        statusEl.textContent = modeUsed === 'server'
+          ? 'تم حفظ النتيجة المجهولة (قبلي / بعدي / تثبيت 3–4 أسابيع) في قاعدة البيانات بنجاح.'
+          : 'تم حفظ النتيجة المجهولة (قبلي / بعدي / تثبيت 3–4 أسابيع) محلياً في المتصفح بنجاح.';
+      }
     } catch (err) {
-      statusEl.textContent = err.message;
+      if (statusEl) {
+        statusEl.textContent = err.message;
+      }
     }
   });
 
